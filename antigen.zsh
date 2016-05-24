@@ -163,12 +163,10 @@ antigen-revert () {
         echo .zprezto
 
     else
-        autoload -U regexp-replace
-        local clone_dir="$1"
-        regexp-replace clone_dir '/' '-SLASH-'
-        regexp-replace clone_dir ':' '-COLON-'
-        regexp-replace clone_dir '\|' '-PIPE-'
-        echo $clone_dir
+        echo "$1" | sed \
+            -e 's./.-SLASH-.g' \
+            -e 's.:.-COLON-.g' \
+            -e 's.|.-PIPE-.g'
 
     fi
 }
@@ -279,19 +277,11 @@ antigen-revert () {
         # Source the plugin script.
         # FIXME: I don't know. Looks very very ugly. Needs a better
         # implementation once tests are ready.
-        local script_loc_test
-        local script_loc
-        # todo: figure out zsh single line equivalent
-        for script_loc_test in "$location"/* ; do
-          if [[ $script_loc_test =~ '\.plugin\.zsh$' ]]; then
-            script_loc="$script_loc_test"
-            break
-          fi
-        done
+        local script_loc="$(ls "$location" | grep '\.plugin\.zsh$' | head -n1)"
 
-        if [[ -f $script_loc ]]; then
+        if [[ -f $location/$script_loc ]]; then
             # If we have a `*.plugin.zsh`, source it.
-            source "$script_loc"
+            source "$location/$script_loc"
 
         elif [[ -f $location/init.zsh ]]; then
             # If we have a `init.zsh`
@@ -304,12 +294,12 @@ antigen-revert () {
                 source "$location/init.zsh"
             fi
 
-        elif (){ setopt localoptions nonomatch nocshnullglob nonullglob; [ -f "$location"/*.zsh(.[1]) ] }; then
+        elif ls "$location" | grep -l '\.zsh$' &> /dev/null; then
             # If there is no `*.plugin.zsh` file, source *all* the `*.zsh`
             # files.
             for script ($location/*.zsh(N)) { source "$script" }
 
-        elif (){ setopt localoptions nonomatch nocshnullglob nonullglob; [ -f "$location"/*.sh(.[1]) ] }; then
+        elif ls "$location" | grep -l '\.sh$' &> /dev/null; then
             # If there are no `*.zsh` files either, we look for and source any
             # `*.sh` files instead.
             for script ($location/*.sh(N)) { source "$script" }
@@ -586,18 +576,6 @@ antigen () {
     fi
 }
 
--antigen-arraygrep () {
-  # grep through an array
-  # First argument: *name* (not contents) of array variable
-  local line
-  for line in ${(P)1} ; do
-    if [[ "$line" =~ "^$name:?\??" ]] ; then
-      echo $line
-      break
-    fi
-  done
-}
-
 -antigen-parse-args () {
     # An argument parsing functionality to parse arguments the *antigen* way :).
     # Takes one first argument (called spec), which dictates how to parse and
@@ -623,14 +601,11 @@ antigen () {
 
     # See the test file, tests/arg-parser.t for (working) examples.
 
-    autoload -U regexp-replace
-
     local spec="$1"
     shift
 
     # Sanitize the spec
-    regexp-replace spec '\\n' ' '
-    regexp-replace spec '[[:space:]]' ''
+    spec="$(echo "$spec" | tr '\n' ' ' | sed 's/[[:space:]]//g')"
 
     local code=''
 
@@ -639,13 +614,9 @@ antigen () {
         code="${code}local $1='$2'"
     }
 
-    local spec_array
-    spec_array=("${(@s/;/)spec}")
-
-    local positional_args="${spec_array[1]}"
-    local positional_args_array
-    positional_args_array=("${(@s/,/)positional_args}")
-    local positional_args_count="${#positional_args_array}"
+    local positional_args="$(echo "$spec" | cut -d\; -f1)"
+    local positional_args_count="$(echo $positional_args |
+            awk -F, '{print NF}')"
 
     # Set spec values based on the positional arguments.
     local i=1
@@ -657,11 +628,11 @@ antigen () {
             return
         fi
 
-        local name_spec="${positional_args_array[$i]}"
+        local name_spec="$(echo "$positional_args" | cut -d, -f$i)"
         local name="${${name_spec%\?}%:}"
         local value="$1"
 
-        if [[ "$code" =~ "(^|\n)local $name=" ]]; then
+        if echo "$code" | grep -l "^local $name=" &> /dev/null; then
             echo "Argument '$name' repeated with the value '$value'". >&2
             return
         fi
@@ -672,24 +643,21 @@ antigen () {
         i=$(($i + 1))
     done
 
-    local keyword_args
-    local keyword_args_array
-    keyword_args_array=()
-    local line
+    local keyword_args="$(
+            # Positional arguments can double up as keyword arguments too.
+            echo "$positional_args" | tr , '\n' |
+                while read line; do
+                    if [[ $line == *\? ]]; then
+                        echo "${line%?}:?"
+                    else
+                        echo "$line:"
+                    fi
+                done
 
-    # Positional arguments can double up as keyword arguments too.
-    for i in {1..$positional_args_count}; do
-      line=${positional_args_array[$i]}
-      if [[ $line == *\? ]]; then
-        keyword_args_array+=("${line%?}:?")
-      else
-        keyword_args_array+=("$line:")
-      fi
-    done
-    # Specified keyword arguments.
-    keyword_args_array+=("${(@s/,/)spec_array[2]}")
-    keyword_args=${(F)keyword_args_array}
-    local keyword_args_count="${#keyword_args_array}"
+            # Specified keyword arguments.
+            echo "$spec" | cut -d\; -f2 | tr , '\n'
+            )"
+    local keyword_args_count="$(echo $keyword_args | awk -F, '{print NF}')"
 
     # Set spec values from keyword arguments, if any. The remaining arguments
     # are all assumed to be keyword arguments.
@@ -706,13 +674,14 @@ antigen () {
             local value="${arg#*=}"
         fi
 
-        if [[ "$code" =~ "(^|\n)local $name=" ]]; then
+        if echo "$code" | grep -l "^local $name=" &> /dev/null; then
             echo "Argument '$name' repeated with the value '$value'". >&2
             return
         fi
 
         # The specification for this argument, used for validations.
-        local arg_line="$(-antigen-arraygrep keyword_args_array)"
+        local arg_line="$(echo "$keyword_args" |
+                            egrep "^$name:?\??" | head -n1)"
 
         # Validate argument and value.
         if [[ -z $arg_line ]]; then
@@ -720,12 +689,14 @@ antigen () {
             echo "Unknown argument '$name'." >&2
             return
 
-        elif [[ "$arg_line" =~ ':' && -z $value ]]; then
+        elif (echo "$arg_line" | grep -l ':' &> /dev/null) &&
+                [[ -z $value ]]; then
             # This argument needs a value, but is not provided.
             echo "Required argument for '$name' not provided." >&2
             return
 
-        elif [[ ! ("$arg_line" =~ ':') && -n $value ]]; then
+        elif (echo "$arg_line" | grep -vl ':' &> /dev/null) &&
+                [[ -n $value ]]; then
             # This argument doesn't need a value, but is provided.
             echo "No argument required for '$name', but provided '$value'." >&2
             return
